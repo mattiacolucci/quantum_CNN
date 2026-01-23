@@ -1,12 +1,18 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
 [project]
-name = "progetto"
+name = "src"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "dagshub>=0.6.4",
     "loguru>=0.7.3",
     "matplotlib>=3.10.8",
+    "mlflow>=3.8.1",
     "pylatexenc>=2.10",
     "qiskit>=2.3.0",
     "qiskit-aer>=0.17.2",

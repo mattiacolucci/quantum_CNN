@@ -24,7 +24,10 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend to avoid tkinter threading issues
 import matplotlib.pyplot as plt
 import argparse
+import dagshub
+import mlflow
 from tqdm import tqdm
+from sklearn.model_selection import KFold
 
 
 from qiskit import QuantumCircuit
@@ -46,7 +49,9 @@ from src.utils.feature_maps import (
 )
 from src.utils.ansatz import tensor_ring
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
+
+dagshub.init(repo_owner='mattiacolucci', repo_name='quantum_CNN', mlflow=True)
 
 
 class CNNFeatureExtractor(nn.Module):
@@ -201,14 +206,25 @@ class HybridCNNQNN(nn.Module):
         self.linear = nn.Linear(1, num_classes)  # Map quantum output to classes
         self.softmax = nn.Softmax(dim=1)
         
+    def to(self, device):
+        """Override to() to handle quantum circuit properly"""
+        # Only move CNN and linear layer to device (QNN stays on CPU)
+        self.cnn = self.cnn.to(device)
+        self.linear = self.linear.to(device)
+        return self
+        
     def forward(self, x, apply_softmax=False):
-        # Extract features with CNN
+        # Extract features with CNN (on GPU if available)
+        cnn_device = next(self.cnn.parameters()).device
         x = self.cnn(x)  # (batch, 4)
         
-        # Process with quantum circuit
-        x = self.qnn(x)  # (batch, 1)
+        # Process with quantum circuit (requires CPU)
+        # Move to CPU for quantum circuit, then back to original device
+        x_cpu = x.cpu()
+        x_qnn = self.qnn(x_cpu)  # (batch, 1) - runs on CPU
+        x = x_qnn.to(cnn_device)  # Move back to GPU if needed
         
-        # Projection to class logits
+        # Projection to class logits (on GPU if available)
         x = self.linear(x)  # (batch, num_classes)
 
         # Final probabilities
@@ -219,18 +235,18 @@ class HybridCNNQNN(nn.Module):
         return x
 
 
-def load_mnist_dataloader(num_classes=4, samples_per_class=100, batch_size=32, seed=12345):
+def load_mnist_dataset(num_classes=4, samples_per_class=100, k_folds=5, seed=12345):
     """
     Load MNIST data and create PyTorch DataLoaders.
     
     Args:
         num_classes (int): Number of classes to use (4, 6, or 8)
         samples_per_class (int): Number of samples per class
-        batch_size (int): Batch size for training
+        k_folds (int): Number of folds for cross-validation
         seed (int): Random seed
     
     Returns:
-        train_loader, test_loader, (num_train, num_test)
+        train_dataset, test_dataset, validation_dataset
     """
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -241,55 +257,75 @@ def load_mnist_dataloader(num_classes=4, samples_per_class=100, batch_size=32, s
         transforms.ToTensor()
     ])
     
-    mnist_train = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-    mnist_test = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    mnist_train = datasets.MNIST(root="../data", train=True, download=True, transform=transform)
+    mnist_test = datasets.MNIST(root="../data", train=False, download=True, transform=transform)
 
-    X_train = mnist_train.data / 255.0
-    y_train = mnist_train.targets
+    # Extract data and targets before merging
+    all_data = torch.cat([mnist_train.data, mnist_test.data], dim=0)
+    all_targets = torch.cat([mnist_train.targets, mnist_test.targets], dim=0)
 
-    X_test = mnist_test.data / 255.0
-    y_test = mnist_test.targets
-    
-    # Filter by number of classes and sample
-    selected_indices = []
-    for class_label in range(num_classes):
-        # Get all samples of this class
-        indices = [i for i, (_, label) in enumerate(mnist_train) if label == class_label]
+    kfold_datasets = []
+
+    # Stratified K-Fold cross-validation split
+    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
+
+    for fold, (train_ids, test_ids) in enumerate(kfold.split(all_data)):
+
+        # Create subset for validation from training set
+        val_size = int(0.5 * len(test_ids))
+        val_ids = test_ids[:val_size]
+        test_ids = test_ids[val_size:]
+
+        # Extract data and normalize
+        X_train = all_data[train_ids] / 255.0
+        y_train = all_targets[train_ids]
+
+        X_test = all_data[test_ids] / 255.0
+        y_test = all_targets[test_ids]
         
-        # Random sample
-        selected = np.random.choice(indices, samples_per_class, replace=False)
+        X_val = all_data[val_ids] / 255.0
+        y_val = all_targets[val_ids]
+    
+        # Filter by number of classes and sample
+        selected_indices = []
+        for class_label in range(num_classes):
+            # Get all samples of this class
+            indices = [i for i in range(len(y_train)) if y_train[i] == class_label]
+            
+            # Random sample
+            selected = np.random.choice(indices, samples_per_class, replace=False)
+            
+            selected_indices.extend(selected)
+    
+        # Convert to tensors
+        X_train_subset = X_train[selected_indices]
+        y_train_subset = y_train[selected_indices]
         
-        selected_indices.extend(selected)
+        # Shuffle
+        shuffle_idx = torch.randperm(len(X_train_subset))
+        X_train = X_train_subset[shuffle_idx]
+        y_train = y_train_subset[shuffle_idx]
+        
+        logger.info(f"Train dataset shape: {X_train.shape}, Labels shape: {y_train.shape}")
+        logger.info(f"Test dataset shape: {X_test.shape}, Labels shape: {y_test.shape}")
+        
+        # Create DataLoaders
+        train_dataset = TensorDataset(X_train.unsqueeze(1), y_train)
+        test_dataset = TensorDataset(X_test.unsqueeze(1), y_test)
+        validation_dataset = TensorDataset(X_val.unsqueeze(1), y_val)
+
+        kfold_datasets.append({"train": train_dataset, "test": test_dataset, "validation": validation_dataset})
     
-    # Convert to tensors
-    X_train_subset = X_train[selected_indices]
-    y_train_subset = y_train[selected_indices]
+    logger.info(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}, Validation size: {len(validation_dataset)}")
     
-    # Shuffle
-    shuffle_idx = torch.randperm(len(X_train_subset))
-    X_train = X_train_subset[shuffle_idx]
-    y_train = y_train_subset[shuffle_idx]
-    
-    logger.info(f"Train dataset shape: {X_train.shape}, Labels shape: {y_train.shape}")
-    logger.info(f"Test dataset shape: {X_test.shape}, Labels shape: {y_test.shape}")
-    
-    # Create DataLoaders
-    train_dataset = TensorDataset(X_train.unsqueeze(1), y_train)
-    test_dataset = TensorDataset(X_test.unsqueeze(1), y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    logger.info(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}")
-    logger.info(f"Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
-    
-    return train_loader, test_loader, (len(train_dataset), len(test_dataset))
+    return kfold_datasets
 
 
 def train_hybrid_model(
     model,
     train_loader,
     test_loader,
+    validation_loader,
     epochs=20,
     learning_rate=0.001,
     device='cpu',
@@ -302,6 +338,7 @@ def train_hybrid_model(
         model: HybridCNNQNN model
         train_loader: Training data loader
         test_loader: Test data loader
+        validation_loader: Validation data loader
         epochs (int): Number of training epochs
         learning_rate (float): Learning rate
         device (str): 'cpu' or 'cuda'
@@ -313,11 +350,6 @@ def train_hybrid_model(
     model = model.to(device)
     model.train()
     
-    # Create log directory
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f'training_log_{timestamp}.json')
-    
     # Optimizer and loss
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
@@ -325,18 +357,18 @@ def train_hybrid_model(
     # Training history
     history = {
         'best_epoch': 0,
-        'best_test_f1': 0.0,
-        'best_train_f1': 0.0,
-        'best_train_loss': float('inf')
+        'best_train': {},
+        'best_test': {},
+        'best_val': {'f1': 0.0},
+        'epoch_times': [],
     }
     
     # Track best model
-    best_test_f1 = 0.0
-    best_model_state = None
+    patient = 0
+    early_stop = 5  # Early stopping patience
     
     # Log training configuration
     config_log = {
-        'timestamp': timestamp,
         'device': device,
         'learning_rate': learning_rate,
         'epochs': epochs,
@@ -382,37 +414,43 @@ def train_hybrid_model(
             targets.extend(target.cpu().numpy())
         
         # Epoch statistics
+        model.eval()
         avg_loss = total_loss / len(train_loader)
         train_metrics = compute_metrics(preds, targets)
+        train_metrics['loss'] = avg_loss
+
+        # Validation evaluation
+        val_metrics = evaluate_model(model, validation_loader, device)
 
         # Test evaluation
         test_metrics = evaluate_model(model, test_loader, device)
         
         # Save history
         epoch_time = time.time() - epoch_start
+        history['epoch_times'].append(epoch_time)
         
         # Track best model
-        if test_metrics["f1"] > best_test_f1:
-            best_test_f1 = test_metrics["f1"]
+        if val_metrics["f1"] > history['best_val']['f1']:
+            # Track best model performance
+            history['best_train'] = train_metrics
+            history['best_test'] = test_metrics
+            history['best_val'] = val_metrics
             history['best_epoch'] = epoch + 1
-            history['best_test_f1'] = test_metrics["f1"]
-            history['best_train_f1'] = train_metrics["f1"]
-            history['best_train_loss'] = avg_loss
             logger.info(f"✓ New best model! Test F1: {test_metrics['f1']:.4f}")
 
             # Save best model to file
-            torch.save(model.state_dict(), os.path.join(log_dir, f'best_model_epoch{epoch+1}.pth')) 
+            torch.save(model.state_dict(), os.path.join(log_dir, f'best_model_epoch{epoch+1}.pth'))
+            patient = 0
+        else:
+            patient += 1
+            if patient > early_stop:
+                break
         
         # Log to console
         logger.info(f"Epoch {epoch+1}/{epochs} - Time: {epoch_time:.2f}s")
         logger.info(f"Train Loss: {avg_loss:.4f}, Train Acc: {train_metrics['acc']:.4f}, Train F1: {train_metrics['f1']:.2f}%, Train Precision: {train_metrics['precision']:.2f}%, Train Recall: {train_metrics['recall']:.2f}%")
         logger.info(f"Test Acc: {test_metrics['acc']:.4f}, Test F1: {test_metrics['f1']:.2f}%, Test Precision: {test_metrics['precision']:.2f}%, Test Recall: {test_metrics['recall']:.2f}%")
         logger.info("-" * 60)
-    
-    # Load best model state
-    if best_model_state is not None:
-        model.load_state_dict(torch.load(os.path.join(log_dir, f'best_model_epoch{history["best_epoch"]}.pth'), weights_only=True))
-        logger.info(f"Loaded best model from epoch {history['best_epoch']}")
     
     # Final comprehensive log
     history['total_training_time'] = sum(history['epoch_times'])
@@ -421,11 +459,13 @@ def train_hybrid_model(
     logger.info("Training Complete!")
     logger.info(f"Best Results:")
     logger.info(f"  Epoch: {history['best_epoch']}/{epochs}")
-    logger.info(f"  Test F1: {history['best_test_f1']:.2f}%")
-    logger.info(f"  Train F1: {history['best_train_f1']:.2f}%")
-    logger.info(f"  Train Loss: {history['best_train_loss']:.4f}")
+    logger.info(f"  Train: {history['best_train']}")
+    logger.info(f"  Test: {history['best_test']}")
+    logger.info(f"  Validation: {history['best_val']}")
     logger.info(f"Total Training Time: {history['total_training_time']:.2f}s")
     logger.info("=" * 60)
+
+    return history
 
 
 def evaluate_model(model, test_loader, device='cpu'):
@@ -452,23 +492,23 @@ def evaluate_model(model, test_loader, device='cpu'):
             preds.extend(pred.cpu().numpy())
             targets.extend(target.cpu().numpy())
     
-    return compute_metrics(targets, preds)
+    return compute_metrics(preds, targets)
 
-def compute_metrics(y_true, y_pred):
+def compute_metrics(y_pred, y_true):
     """
     Compute accuracy, precision, recall, and F1-score.
     
     Args:
-        y_true (list or np.array): True labels
         y_pred (list or np.array): Predicted labels
+        y_true (list or np.array): True labels
     Returns:
         dict: Dictionary with accuracy, precision, recall, F1-score
     """
     
     accuracy = accuracy_score(y_true, y_pred) * 100.0
-    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0) * 100.0
-    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0) * 100.0
-    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0) * 100.0
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0) * 100.0
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0) * 100.0
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0) * 100.0
     
     return {
         'acc': accuracy,
@@ -509,71 +549,137 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Hybrid CNN-QNN Classifier for MNIST")
     parser.add_argument('--num_classes', type=int, default=4, help='Number of classes to classify (4, 6, or 8)')
-    parser.add_argument('--samples_per_class', type=int, default=50, help='Number of samples per class for training')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--samples_per_class', type=int, default=400, help='Number of samples per class for training')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
     parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial'], help='Type of feature map for data re-uploading')
     parser.add_argument('--reps', type=int, default=2, help='Number of [feature_map → ansatz] repetitions')
     args = parser.parse_args()
 
-    # Configuration
-    NUM_CLASSES = args.num_classes
-    SAMPLES_PER_CLASS = args.samples_per_class
-    BATCH_SIZE = args.batch_size
-    EPOCHS = args.epochs
-    LEARNING_RATE = args.learning_rate
-    FEATURE_MAP_TYPE = args.feature_map_type
-    REPS = args.reps  # Number of [feature_map → ansatz] repetitions (standard=2, partial=3)
+    with mlflow.start_run():
+        # Configuration
+        NUM_CLASSES = args.num_classes
+        SAMPLES_PER_CLASS = args.samples_per_class
+        BATCH_SIZE = args.batch_size
+        EPOCHS = args.epochs
+        LEARNING_RATE = args.learning_rate
+        FEATURE_MAP_TYPE = args.feature_map_type
+        REPS = args.reps  # Number of [feature_map → ansatz] repetitions (standard=2, partial=3)
 
-    # Make result directory
-    results_dir = f'./results/standard_re-uploading_MNIST_{NUM_CLASSES}_classes'
-    os.makedirs(results_dir, exist_ok=True)
-    logging.basicConfig(filename=f"{results_dir}/hybrid_cnn_qnn.log", level=logging.INFO)
-    
-    # Device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"Using device: {device}")
-    
-    # Load data
-    logger.info(f"Loading MNIST data: {NUM_CLASSES} classes, {SAMPLES_PER_CLASS} samples/class")
-    train_loader, test_loader, (num_train, num_test) = load_mnist_dataloader(
-        num_classes=NUM_CLASSES,
-        samples_per_class=SAMPLES_PER_CLASS,
-        batch_size=BATCH_SIZE
-    )
-    
-    # Create quantum circuit with repetitions
-    logger.info(f"Creating quantum circuit: {FEATURE_MAP_TYPE} re-uploading with {REPS} repetitions")
-    qnn, circuit = create_quantum_circuit(
-        feature_map_type=FEATURE_MAP_TYPE, 
-        num_qubits=4,
-        reps=REPS
-    )
+        # Log configuration to mlflow
+        mlflow.log_params({
+            'num_classes': NUM_CLASSES,
+            'samples_per_class': SAMPLES_PER_CLASS,
+            'batch_size': BATCH_SIZE,
+            'epochs': EPOCHS,
+            'learning_rate': LEARNING_RATE,
+            'feature_map_type': FEATURE_MAP_TYPE,
+            'reps': REPS
+        })
 
-    # Plot and save quantum circuit diagram showing architecture
-    # decompose_depth=0 shows high-level blocks (feature maps + ansatz)
-    # decompose_depth=1+ shows individual gates (more detailed)
-    """circuit_plot_file = os.path.join(results_dir, f'quantum_circuit_{FEATURE_MAP_TYPE}_{NUM_CLASSES}classes_reps{REPS}.png')
-    plot_circuit(circuit, filename=circuit_plot_file, decompose_depth=1)"""
-    
-    # Create hybrid model
-    logger.info("Building hybrid CNN-QNN model...")
-    model = HybridCNNQNN(qnn, num_classes=NUM_CLASSES)
-    logger.info(f"Model created successfully")
-    logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    
-    # Train model with logging
-    train_hybrid_model(
-        model,
-        train_loader,
-        test_loader,
-        epochs=EPOCHS,
-        learning_rate=LEARNING_RATE,
-        device=device,
-        log_dir=results_dir
-    )
+        # Make result directory
+        results_dir = f'../results/{FEATURE_MAP_TYPE}_re-uploading_MNIST_{NUM_CLASSES}_classes_reps{REPS}'
+        os.makedirs(results_dir, exist_ok=True)
+        
+        # Configure logging to write to both file and console
+        log_file = os.path.join(results_dir, 'hybrid_cnn_qnn.log')
+        file_handler = logging.FileHandler(log_file, mode='w')
+        file_handler.setLevel(logging.INFO)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        logger.setLevel(logging.INFO)
+        
+        # Device
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.info(f"Using device: {device}")
+        
+        # Load data
+        logger.info(f"Loading MNIST data: {NUM_CLASSES} classes, {SAMPLES_PER_CLASS} samples/class")
+        kfold_datasets = load_mnist_dataset(
+            num_classes=NUM_CLASSES,
+            samples_per_class=SAMPLES_PER_CLASS
+        )
+        
+        # Create quantum circuit with repetitions
+        logger.info(f"Creating quantum circuit: {FEATURE_MAP_TYPE} re-uploading with {REPS} repetitions")
+        qnn, circuit = create_quantum_circuit(
+            feature_map_type=FEATURE_MAP_TYPE, 
+            num_qubits=4,
+            reps=REPS
+        )
+
+        # Plot and save quantum circuit diagram showing architecture
+        # decompose_depth=0 shows high-level blocks (feature maps + ansatz)
+        # decompose_depth=1+ shows individual gates (more detailed)
+        """circuit_plot_file = os.path.join(results_dir, f'quantum_circuit_{FEATURE_MAP_TYPE}_{NUM_CLASSES}classes_reps{REPS}.png')
+        plot_circuit(circuit, filename=circuit_plot_file, decompose_depth=1)"""
+
+        # Kfold training
+        results = []
+        for fold_idx, fold in enumerate(kfold_datasets):
+            logger.info("="*60)
+            logger.info(f"FOLD {fold_idx+1}/{len(kfold_datasets)} Training")
+            logger.info("="*60)
+            
+            # Create a fresh hybrid model for each fold
+            logger.info("Building hybrid CNN-QNN model...")
+            model = HybridCNNQNN(qnn, num_classes=NUM_CLASSES).to(device)
+            logger.info(f"Model created successfully")
+            logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+            logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+            # Use pinned memory for faster CPU-GPU transfers (if using CUDA)
+            use_pinned = (device == 'cuda')
+            train_loader = DataLoader(fold["train"], batch_size=BATCH_SIZE, shuffle=True, 
+                                    pin_memory=use_pinned, num_workers=0)
+            test_loader = DataLoader(fold["test"], batch_size=BATCH_SIZE, shuffle=False, 
+                                   pin_memory=use_pinned, num_workers=0)
+            validation_loader = DataLoader(fold["validation"], batch_size=BATCH_SIZE, shuffle=False,
+                                         pin_memory=use_pinned, num_workers=0)
+
+            os.makedirs(os.path.join(results_dir, f"fold_{fold_idx+1}"), exist_ok=True)
+        
+            # Train model with logging
+            res = train_hybrid_model(
+                model,
+                train_loader,
+                test_loader,
+                validation_loader,
+                epochs=EPOCHS,
+                learning_rate=LEARNING_RATE,
+                device=device,
+                log_dir=os.path.join(results_dir, f"fold_{fold_idx+1}")
+            )
+            results.append(res)
+
+        # Average results over folds
+        avg_results = {}
+        for key in results[0].keys():
+            if key == 'epoch_times':
+                continue
+            avg_results[key] = {}
+            for metric in results[0][key].keys():
+                avg_results[key][metric] = np.mean([r[key][metric] for r in results])            
+
+        # Log metrics to mlflow
+        mlflow.log_metrics({
+            'best_train_acc': avg_results['best_train']['acc'],
+            'best_train_f1': avg_results['best_train']['f1'],
+            'best_train_precision': avg_results['best_train']['precision'],
+            'best_train_recall': avg_results['best_train']['recall'],
+            'best_test_acc': avg_results['best_test']['acc'],
+            'best_test_f1': avg_results['best_test']['f1'],
+            'best_test_precision': avg_results['best_test']['precision'],
+            'best_test_recall': avg_results['best_test']['recall'],
+            'best_val_acc': avg_results['best_val']['acc'],
+            'best_val_f1': avg_results['best_val']['f1'],
+            'best_val_precision': avg_results['best_val']['precision'],
+            'best_val_recall': avg_results['best_val']['recall'],
+            'total_training_time_sec': avg_results['total_training_time']
+        })
 
 if __name__ == '__main__':
     main()

@@ -37,7 +37,7 @@ from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter, ParameterVector
 from qiskit.circuit.library import RealAmplitudes, ZZFeatureMap
 from qiskit_aer import AerSimulator
-from qiskit_aer.primitives import EstimatorV2
+from qiskit_aer.primitives import EstimatorV2 as AerEstimator
 from qiskit_machine_learning.neural_networks import EstimatorQNN
 from qiskit_machine_learning.connectors import TorchConnector
 from qiskit.quantum_info import SparsePauliOp
@@ -187,18 +187,25 @@ def create_quantum_circuit_gpu(feature_map_type='standard', num_qubits=4, reps=2
     circuit_with_measurements = full_circuit.copy()
     circuit_with_measurements.measure_all()
     
-    # Create GPU-enabled or CPU backend
+    # Create GPU-enabled or CPU estimator
+    estimator = AerEstimator()
+    
     if qiskit_device == 'GPU':
-        # Configure GPU backend
-        backend = AerSimulator(method='statevector', device='GPU')
+        # Configure GPU backend via options
         logger.info(f"✓ AerSimulator configured with GPU acceleration")
+        estimator.options.backend_options = {
+            'method': 'statevector',
+            'device': 'GPU'
+        }
     else:
         # Fallback to CPU
-        backend = AerSimulator(method='statevector', device='CPU')
         logger.info(f"AerSimulator configured with CPU")
+        estimator.options.backend_options = {
+            'method': 'statevector',
+            'device': 'CPU'
+        }
     
-    # Create EstimatorV2 with GPU-enabled backend
-    estimator = EstimatorV2(backend=backend)
+    # Set shot options
     estimator.options.default_shots = 4096
     estimator.options.seed_simulator = 12345
     
@@ -260,61 +267,84 @@ class HybridCNNQNN_GPU(nn.Module):
         
         return x
 
-
-def load_mnist_dataset(num_classes=4, samples_per_class=100, k_folds=5, seed=12345):
-    """Load MNIST data and create PyTorch DataLoaders."""
+def load_mnist_dataset(num_classes=4, samples_per_class=100, batch_size=32, device='cpu', seed=12345):
+    """
+    Load MNIST data and create PyTorch DataLoaders.
+    
+    Args:
+        num_classes (int): Number of classes to use (4, 6, or 8)
+        samples_per_class (int): Number of samples per class
+        batch_size (int): Batch size for DataLoaders
+        seed (int): Random seed
+    
+    Returns:
+        train_loader, test_loader, validation_loader: DataLoaders for training, testing, and validation
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     
+    # Load MNIST
     logger.info(f"Loading MNIST dataset with {num_classes} classes...")
-    transform = transforms.Compose([transforms.ToTensor()])
+    transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
     
     mnist_train = datasets.MNIST(root="../data", train=True, download=True, transform=transform)
     mnist_test = datasets.MNIST(root="../data", train=False, download=True, transform=transform)
 
-    all_data = torch.cat([mnist_train.data, mnist_test.data], dim=0)
-    all_targets = torch.cat([mnist_train.targets, mnist_test.targets], dim=0)
+    X_train = mnist_train.data / 255.0  # Normalize to [0,1]
+    y_train = mnist_train.targets
 
-    kfold_datasets = []
-    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
+    X_test = mnist_test.data / 255.0
+    y_test = mnist_test.targets
 
-    for fold, (train_ids, test_ids) in enumerate(kfold.split(all_data)):
-        val_size = int(0.5 * len(test_ids))
-        val_ids = test_ids[:val_size]
-        test_ids = test_ids[val_size:]
+    # Split a validation set from test set data (50%)
+    val_size = len(X_test) // 2
+    X_val = X_test[:val_size]
+    y_val = y_test[:val_size]
 
-        X_train = all_data[train_ids] / 255.0
-        y_train = all_targets[train_ids]
-        X_test = all_data[test_ids] / 255.0
-        y_test = all_targets[test_ids]
-        X_val = all_data[val_ids] / 255.0
-        y_val = all_targets[val_ids]
-    
-        selected_indices = []
-        for class_label in range(num_classes):
-            indices = [i for i in range(len(y_train)) if y_train[i] == class_label]
-            selected = np.random.choice(indices, samples_per_class, replace=False)
-            selected_indices.extend(selected)
-    
-        X_train_subset = X_train[selected_indices]
-        y_train_subset = y_train[selected_indices]
+    X_test = X_test[val_size:]
+    y_test = y_test[val_size:]
+
+    # Filter by number of classes and sample
+    selected_indices = []
+    for class_label in range(num_classes):
+        # Get all samples of this class
+        indices = [i for i in range(len(y_train)) if y_train[i] == class_label]
         
-        shuffle_idx = torch.randperm(len(X_train_subset))
-        X_train = X_train_subset[shuffle_idx]
-        y_train = y_train_subset[shuffle_idx]
+        # Random sample
+        selected = np.random.choice(indices, samples_per_class, replace=False)
         
-        logger.info(f"Train dataset shape: {X_train.shape}, Labels shape: {y_train.shape}")
-        logger.info(f"Test dataset shape: {X_test.shape}, Labels shape: {y_test.shape}")
-        
-        train_dataset = TensorDataset(X_train.unsqueeze(1), y_train)
-        test_dataset = TensorDataset(X_test.unsqueeze(1), y_test)
-        validation_dataset = TensorDataset(X_val.unsqueeze(1), y_val)
+        selected_indices.extend(selected)
 
-        kfold_datasets.append({"train": train_dataset, "test": test_dataset, "validation": validation_dataset})
+    # Convert to tensors
+    X_train_subset = X_train[selected_indices]
+    y_train_subset = y_train[selected_indices]
     
-    logger.info(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}, Validation size: {len(validation_dataset)}")
+    # Shuffle
+    shuffle_idx = torch.randperm(len(X_train_subset))
+    X_train = X_train_subset[shuffle_idx]
+    y_train = y_train_subset[shuffle_idx]
     
-    return kfold_datasets
+    logger.info(f"Train dataset shape: {X_train.shape}, Labels shape: {y_train.shape}")
+    logger.info(f"Test dataset shape: {X_test.shape}, Labels shape: {y_test.shape}")
+    logger.info(f"Validation dataset shape: {X_val.shape}, Labels shape: {y_val.shape}")
+    
+    # Create DataLoaders
+    train_dataset = TensorDataset(X_train.unsqueeze(1), y_train)
+    test_dataset = TensorDataset(X_test.unsqueeze(1), y_test)
+    validation_dataset = TensorDataset(X_val.unsqueeze(1), y_val)
+
+    # Use pinned memory for faster CPU-GPU transfers (if using CUDA)
+    use_pinned = (device == 'cuda')
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                            pin_memory=use_pinned, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                            pin_memory=use_pinned, num_workers=0)
+    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False,
+                                         pin_memory=use_pinned, num_workers=0)
+
+    return train_loader, test_loader, validation_loader
 
 
 def train_hybrid_model(
@@ -370,7 +400,7 @@ def train_hybrid_model(
         preds = []
         targets = []
         
-        for batch_idx, (data, target) in enumerate(train_loader):
+        for batch_idx, (data, target) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
             data, target = data.to(device), target.to(device)
             
             optimizer.zero_grad()
@@ -530,9 +560,11 @@ def main():
         
         # Load data
         logger.info(f"Loading MNIST data: {NUM_CLASSES} classes, {SAMPLES_PER_CLASS} samples/class")
-        kfold_datasets = load_mnist_dataset(
+        train_loader, test_loader, validation_loader = load_mnist_dataset(
             num_classes=NUM_CLASSES,
-            samples_per_class=SAMPLES_PER_CLASS
+            samples_per_class=SAMPLES_PER_CLASS,
+            batch_size=BATCH_SIZE,
+            device=device
         )
         
         # Create quantum circuit with GPU support
@@ -544,64 +576,46 @@ def main():
             use_gpu=USE_GPU
         )
 
-        # K-fold training
-        results = []
-        for fold_idx, fold in enumerate(kfold_datasets):
-            logger.info("="*60)
-            logger.info(f"FOLD {fold_idx+1}/{len(kfold_datasets)} Training")
-            logger.info("="*60)
-            
-            model = HybridCNNQNN_GPU(qnn, num_classes=NUM_CLASSES, qiskit_on_gpu=(qiskit_device=='GPU')).to(device)
-            logger.info(f"Model created successfully")
-            logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-            logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+         # Plot and save quantum circuit diagram showing architecture
+        # decompose_depth=0 shows high-level blocks (feature maps + ansatz)
+        # decompose_depth=1+ shows individual gates (more detailed)
+        """circuit_plot_file = os.path.join(results_dir, f'quantum_circuit_{FEATURE_MAP_TYPE}_{NUM_CLASSES}classes_reps{REPS}.png')
+        plot_circuit(circuit, filename=circuit_plot_file, decompose_depth=1)"""
 
-            use_pinned = (device == 'cuda')
-            train_loader = DataLoader(fold["train"], batch_size=BATCH_SIZE, shuffle=True, 
-                                    pin_memory=use_pinned, num_workers=0)
-            test_loader = DataLoader(fold["test"], batch_size=BATCH_SIZE, shuffle=False, 
-                                   pin_memory=use_pinned, num_workers=0)
-            validation_loader = DataLoader(fold["validation"], batch_size=BATCH_SIZE, shuffle=False,
-                                         pin_memory=use_pinned, num_workers=0)
+        # Train the model    
+        logger.info("Building hybrid CNN-QNN model...")
+        model = HybridCNNQNN_GPU(qnn, num_classes=NUM_CLASSES, qiskit_on_gpu=(qiskit_device=='GPU')).to(device)
+        logger.info(f"Model created successfully")
+        logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-            os.makedirs(os.path.join(results_dir, f"fold_{fold_idx+1}"), exist_ok=True)
-        
-            res = train_hybrid_model(
-                model,
-                train_loader,
-                test_loader,
-                validation_loader,
-                epochs=EPOCHS,
-                learning_rate=LEARNING_RATE,
-                device=device,
-                log_dir=os.path.join(results_dir, f"fold_{fold_idx+1}")
-            )
-            results.append(res)
-
-        # Average results over folds
-        avg_results = {}
-        for key in results[0].keys():
-            if key == 'epoch_times':
-                continue
-            avg_results[key] = {}
-            for metric in results[0][key].keys():
-                avg_results[key][metric] = np.mean([r[key][metric] for r in results])
+        # Train model with logging
+        res = train_hybrid_model(
+            model,
+            train_loader,
+            test_loader,
+            validation_loader,
+            epochs=EPOCHS,
+            learning_rate=LEARNING_RATE,
+            device=device,
+            log_dir=os.path.join(results_dir)
+        )
 
         # Log metrics to mlflow
         mlflow.log_metrics({
-            'best_train_acc': avg_results['best_train']['acc'],
-            'best_train_f1': avg_results['best_train']['f1'],
-            'best_train_precision': avg_results['best_train']['precision'],
-            'best_train_recall': avg_results['best_train']['recall'],
-            'best_test_acc': avg_results['best_test']['acc'],
-            'best_test_f1': avg_results['best_test']['f1'],
-            'best_test_precision': avg_results['best_test']['precision'],
-            'best_test_recall': avg_results['best_test']['recall'],
-            'best_val_acc': avg_results['best_val']['acc'],
-            'best_val_f1': avg_results['best_val']['f1'],
-            'best_val_precision': avg_results['best_val']['precision'],
-            'best_val_recall': avg_results['best_val']['recall'],
-            'total_training_time_sec': avg_results['total_training_time']
+            'best_train_acc': res['best_train']['acc'],
+            'best_train_f1': res['best_train']['f1'],
+            'best_train_precision': res['best_train']['precision'],
+            'best_train_recall': res['best_train']['recall'],
+            'best_test_acc': res['best_test']['acc'],
+            'best_test_f1': res['best_test']['f1'],
+            'best_test_precision': res['best_test']['precision'],
+            'best_test_recall': res['best_test']['recall'],
+            'best_val_acc': res['best_val']['acc'],
+            'best_val_f1': res['best_val']['f1'],
+            'best_val_precision': res['best_val']['precision'],
+            'best_val_recall': res['best_val']['recall'],
+            'total_training_time_sec': res['total_training_time']
         })
 
         logger.info("="*60)

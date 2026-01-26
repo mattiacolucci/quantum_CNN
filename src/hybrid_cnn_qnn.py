@@ -124,9 +124,9 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2):
     for rep in range(reps):
         # 1. Feature map (data re-uploading) - SAME features each time
         if feature_map_type == 'standard':
-            fm = standard_reuploading_feature_map(num_qubits=num_qubits)
+            fm = standard_reuploading_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
         elif feature_map_type == 'partial':
-            fm = partial_reuploading_feature_map(num_qubits=num_qubits)
+            fm = partial_reuploading_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
         else:
             raise ValueError(f"Unknown feature map type: {feature_map_type}")
         
@@ -234,6 +234,45 @@ class HybridCNNQNN(nn.Module):
         
         return x
 
+class CNNOnly(nn.Module):
+    """
+    Classical CNN only (no quantum circuit) for baseline comparison.
+    """
+    # Conv layers
+    def __init__(self, num_classes=4):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)  # 28x28 -> 28x28
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)  # 14x14 -> 14x14
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)  # 7x7 -> 7x7
+        
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout2d(0.25)
+        
+        # Calculate size after convolutions: 28 -> 14 -> 7 -> 3 (after 3 pools)
+        # But we'll do 2 pools: 28 -> 14 -> 7
+        self.fc1 = nn.Linear(128 * 7 * 7, 128)
+        self.fc2 = nn.Linear(128, num_classes)  # Output one for each MNIST class
+        
+    def forward(self, x):
+        # Conv blocks
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)  # 28 -> 14
+        
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)  # 14 -> 7
+        
+        x = F.relu(self.conv3(x))
+        x = self.dropout(x)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)  # Flatten: (batch, 128, 7, 7) -> (batch, 128*7*7)
+        
+        # FC layers
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)  # Output num_classes features
+
+        return x
+
 
 def load_mnist_dataset(num_classes=4, samples_per_class=100, batch_size=32, device='cpu', seed=12345):
     """
@@ -293,6 +332,15 @@ def load_mnist_dataset(num_classes=4, samples_per_class=100, batch_size=32, devi
     shuffle_idx = torch.randperm(len(X_train_subset))
     X_train = X_train_subset[shuffle_idx]
     y_train = y_train_subset[shuffle_idx]
+
+    # Preserve only num_classes in test and validation sets
+    test_indices = [i for i in range(len(y_test)) if y_test[i] < num_classes]
+    X_test = X_test[test_indices]
+    y_test = y_test[test_indices]
+
+    val_indices = [i for i in range(len(y_val)) if y_val[i] < num_classes]
+    X_val = X_val[val_indices]
+    y_val = y_val[val_indices]
     
     logger.info(f"Train dataset shape: {X_train.shape}, Labels shape: {y_train.shape}")
     logger.info(f"Test dataset shape: {X_test.shape}, Labels shape: {y_test.shape}")
@@ -546,7 +594,7 @@ def main():
     parser.add_argument('--samples_per_class', type=int, default=400, help='Number of samples per class for training')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for optimizer')
+    parser.add_argument('--learning_rate', type=float, default=0.0005, help='Learning rate for optimizer')
     parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial'], help='Type of feature map for data re-uploading')
     parser.add_argument('--reps', type=int, default=2, help='Number of [feature_map → ansatz] repetitions')
     args = parser.parse_args()

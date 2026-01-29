@@ -33,13 +33,15 @@ from sklearn.model_selection import KFold
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter, ParameterVector
 from qiskit.circuit.library import RealAmplitudes, ZZFeatureMap
-from qiskit_aer.primitives import EstimatorV2
+from qiskit_aer.primitives import EstimatorV2, SamplerV2
 from qiskit_machine_learning.neural_networks import EstimatorQNN
 from qiskit_machine_learning.connectors import TorchConnector
 from qiskit.quantum_info import SparsePauliOp
 import json
 import os
 from datetime import datetime
+from scipy.stats import entropy
+from scipy.special import comb
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
@@ -407,7 +409,7 @@ def train_hybrid_model(
     
     # Track best model
     patient = 0
-    early_stop = 5  # Early stopping patience
+    early_stop = 20  # Early stopping patience
     
     # Log training configuration
     config_log = {
@@ -559,6 +561,166 @@ def compute_metrics(y_pred, y_true):
         'f1': f1
     }
 
+
+def calculate_expressivity(circuit, num_qubits, trained_params, num_samples=1000, num_bins=75, shots=4096):
+    """
+    Calculate the expressivity of a trained quantum circuit as KL-divergence from the Haar distribution.
+    
+    Following the method from the paper:
+    1. Sample random parameter configurations using trained parameters
+    2. Execute circuit with measurements for each configuration
+    3. Normalize probability distribution: N * p
+    4. Create buckets for the normalized probabilities
+    5. Re-arrange occurrences over buckets and re-count distribution
+    6. Compute Haar measure for each bucket
+    7. Compute KL-divergence between circuit distribution and Haar distribution
+    
+    Args:
+        circuit (QuantumCircuit): The parameterized quantum circuit to evaluate
+        num_qubits (int): Number of qubits in the circuit
+        trained_params (np.array or torch.Tensor): Trained variational parameters from the model
+        num_samples (int): Number of random parameter samples to draw
+        num_bins (int): Number of bins for discretizing the probability distribution
+        shots (int): Number of shots for each circuit execution
+    
+    Returns:
+        float: The expressivity value (KL-divergence from Haar distribution)
+    """
+    logger.info(f"Calculating expressivity with {num_samples} samples and {num_bins} bins...")
+    logger.info("Using trained parameters from the model")
+    
+    # Convert trained params to numpy if needed
+    if hasattr(trained_params, 'detach'):
+        trained_params = trained_params.detach().cpu().numpy()
+    trained_params = np.array(trained_params)
+    
+    # Step 1: Get all parameters from the circuit
+    params = list(circuit.parameters)
+    num_params = len(params)
+    logger.info(f"Circuit has {num_params} parameters")
+    
+    # Separate feature parameters and variational parameters
+    # Feature params: 'x[0]', 'x[1]', ... (first num_qubits params)
+    # Variational params: 'θ_rep0[0]', 'θ_rep0[1]', ... (remaining params)
+    num_feature_params = num_qubits
+    num_var_params = num_params - num_feature_params
+    
+    if len(trained_params) != num_var_params:
+        logger.warning(f"Trained params length ({len(trained_params)}) doesn't match expected ({num_var_params})")
+        # Pad or truncate as needed
+        if len(trained_params) < num_var_params:
+            trained_params = np.pad(trained_params, (0, num_var_params - len(trained_params)), mode='constant')
+        else:
+            trained_params = trained_params[:num_var_params]
+    
+    logger.info(f"Feature parameters: {num_feature_params}, Variational parameters: {num_var_params}")
+    
+    # Add measurements if not present
+    circuit_with_meas = circuit.copy()
+    if circuit_with_meas.num_clbits == 0:
+        circuit_with_meas.measure_all()
+    
+    # Step 2: Sample random parameter configurations and execute circuits
+    sampler = SamplerV2()
+    sampler.options.default_shots = shots
+    sampler.options.seed_simulator = 12345
+    
+    # Collect all probability distributions from samples
+    all_probs = []
+    
+    logger.info("Sampling random input features with trained variational parameters...")
+    for sample_idx in range(num_samples):
+        # Generate random INPUT features uniformly in [0, 2π]
+        # Keep trained VARIATIONAL parameters fixed
+        random_features = np.random.uniform(0, 2 * np.pi, num_feature_params)
+        
+        # Combine: random features + trained variational parameters
+        all_params = np.concatenate([random_features, trained_params])
+        
+        # Bind parameters to circuit
+        param_dict = {params[i]: all_params[i] for i in range(num_params)}
+        bound_circuit = circuit_with_meas.assign_parameters(param_dict)
+        
+        # Execute circuit
+        job = sampler.run([bound_circuit])
+        result = job.result()
+        
+        # Get measurement counts
+        counts = result[0].data.meas.get_counts()
+        
+        # Convert counts to probability distribution
+        # Build probability vector for all 2^n possible outcomes
+        num_states = 2 ** num_qubits
+        prob_dist = np.zeros(num_states)
+        
+        for bitstring, count in counts.items():
+            # Convert bitstring to integer index
+            state_idx = int(bitstring, 2)
+            prob_dist[state_idx] = count / shots
+        
+        all_probs.append(prob_dist)
+    
+    # Convert to array: shape (num_samples, 2^n)
+    all_probs = np.array(all_probs)
+    logger.info(f"Collected {num_samples} probability distributions")
+    
+    # Step 3: Normalization - N * p
+    # For each sample, normalize probabilities by multiplying by number of states
+    N = 2 ** num_qubits
+    normalized_probs = N * all_probs  # Shape: (num_samples, N)
+    
+    # Step 4 & 5: Create buckets and re-arrange occurrences
+    # Flatten all normalized probabilities and histogram them
+    all_normalized_values = normalized_probs.flatten()
+    
+    # Create bins from 0 to N (the maximum possible value of N*p is N when p=1)
+    bin_edges = np.linspace(0, N, num_bins + 1)
+    
+    # Count how many normalized probability values fall in each bin
+    hist, _ = np.histogram(all_normalized_values, bins=bin_edges)
+    
+    # Normalize to get probability distribution over bins
+    circuit_distribution = hist / hist.sum()
+    
+    # Step 6: Compute the Haar measure for each bucket
+    # The Haar measure gives the expected distribution for a random quantum state
+    # For a bucket [k, k+1], the Haar measure is approximately:
+    # P_Haar(k) = (N-1) * (1 - k/N)^(N-2) / N for k in [0, N]
+    
+    # Use bin centers for Haar calculation
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Compute Haar measure for each bin
+    # Formula: (N-1) * (1 - x/N)^(N-2) / N where x is the bin center
+    haar_distribution = np.zeros(num_bins)
+    for i, x in enumerate(bin_centers):
+        if x < N:
+            # Haar distribution formula from Porter-Thomas distribution
+            haar_distribution[i] = (N - 1) * ((1 - x / N) ** (N - 2)) / N
+        else:
+            haar_distribution[i] = 0
+    
+    # Normalize Haar distribution
+    haar_distribution = haar_distribution / haar_distribution.sum()
+    
+    # Step 7: Compute KL-divergence
+    # KL(P || Q) = sum(P(i) * log(P(i) / Q(i)))
+    # Add small epsilon to avoid division by zero and log(0)
+    epsilon = 1e-10
+    circuit_distribution = circuit_distribution + epsilon
+    haar_distribution = haar_distribution + epsilon
+    
+    # Renormalize after adding epsilon
+    circuit_distribution = circuit_distribution / circuit_distribution.sum()
+    haar_distribution = haar_distribution / haar_distribution.sum()
+    
+    # Calculate KL-divergence using scipy
+    kl_divergence = entropy(circuit_distribution, haar_distribution)
+    
+    logger.info(f"Expressivity (KL-divergence from Haar): {kl_divergence:.6f}")
+    
+    return kl_divergence
+
 def plot_circuit(circuit, filename='quantum_circuit.png', decompose_depth=0):
     """
     Plot and save the quantum circuit diagram.
@@ -621,7 +783,7 @@ def main():
         })
 
         # Make result directory
-        results_dir = f'../results/{FEATURE_MAP_TYPE}_re-uploading_MNIST_{NUM_CLASSES}_classes_reps{REPS}'
+        results_dir = f'../results/{FEATURE_MAP_TYPE}_re-uploading_MNIST_{NUM_CLASSES}_classes_{SAMPLES_PER_CLASS}_samples_x_class'
         os.makedirs(results_dir, exist_ok=True)
         
         # Configure logging to write to both file and console
@@ -680,8 +842,31 @@ def main():
             log_dir=os.path.join(results_dir)
         )
 
+        # Calculate expressivity of the quantum circuit AFTER training
+        # Expressivity measures how the trained circuit explores the state space
+        # using the trained variational parameters with random input features
+        logger.info("=" * 60)
+        logger.info("Calculating circuit expressivity (after training)...")
+        logger.info("=" * 60)
+        
+        # Extract trained variational parameters from the QNN
+        trained_weights = model.qnn.weight.detach().cpu().numpy()
+        logger.info(f"Extracted {len(trained_weights)} trained parameters from QNN")
+        
+        expressivity = calculate_expressivity(
+            circuit=circuit,
+            num_qubits=4,
+            trained_params=trained_weights,
+            num_samples=1000,  # Number of random input feature samples
+            num_bins=75,       # Number of bins for distribution
+            shots=4096         # Shots per circuit execution
+        )
+        logger.info(f"Circuit Expressivity (KL-divergence): {expressivity:.6f}")
+        logger.info("=" * 60)
+
         # Log metrics to mlflow
         mlflow.log_metrics({
+            'expressivity': expressivity,
             'best_train_acc': res['best_train']['acc'],
             'best_train_f1': res['best_train']['f1'],
             'best_train_precision': res['best_train']['precision'],

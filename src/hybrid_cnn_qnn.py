@@ -34,7 +34,7 @@ from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter, ParameterVector
 from qiskit.circuit.library import RealAmplitudes, ZZFeatureMap
 from qiskit_aer.primitives import EstimatorV2, SamplerV2
-from qiskit_machine_learning.neural_networks import EstimatorQNN
+from qiskit_machine_learning.neural_networks import SamplerQNN
 from qiskit_machine_learning.connectors import TorchConnector
 from qiskit.quantum_info import SparsePauliOp
 import json
@@ -166,24 +166,24 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2):
     circuit_with_measurements = full_circuit.copy()
     circuit_with_measurements.measure_all()  # Add measurements to all qubits
     
-    # Create EstimatorV2 primitive with options
-    estimator = EstimatorV2()
-    estimator.options.default_shots = 4096
-    estimator.options.seed_simulator = 12345
+    # Create SamplerV2 primitive with options
+    sampler = SamplerV2()
+    sampler.options.default_shots = 4096
+    sampler.options.seed_simulator = 12345
     
-    # Define observable (measure Z on all qubits and sum them)
-    observable = SparsePauliOp.from_list([("Z" * num_qubits, 1.0)])
-    
-    # Create EstimatorQNN with the complete circuit
+    # Create SamplerQNN with the complete circuit
+    # SamplerQNN returns probability distribution over all 2^n computational basis states
+    # For 4 qubits: 16 output values (probabilities for |0000⟩, |0001⟩, ..., |1111⟩)
     # Specify which parameters are inputs (features) and which are weights (variational)
-    qnn = EstimatorQNN(
+    qnn = SamplerQNN(
         circuit=full_circuit,
-        observables=observable,
         input_params=feature_params,
         weight_params=all_var_params,
-        estimator=estimator,
+        sampler=sampler,
         input_gradients=True
     )
+    
+    logger.info(f"SamplerQNN created: returns {2**num_qubits} output values (probability distribution)")
     
     # Wrap with TorchConnector
     torch_connector = TorchConnector(qnn)
@@ -201,18 +201,19 @@ class HybridCNNQNN(nn.Module):
     2. Quantum circuit processes these 4 features
     3. Quantum output is used for classification
     """
-    def __init__(self, qnn, num_classes=4):
+    def __init__(self, qnn, num_classes=4, num_qubits=4):
         super().__init__()
         self.cnn = CNNFeatureExtractor()
         self.qnn = qnn  # TorchConnector wrapped quantum circuit
-        self.linear = nn.Linear(1, num_classes)  # Map quantum output to classes
+        # SamplerQNN returns 2^n probabilities (16 for 4 qubits)
+        self.fc_final = nn.Linear(2**num_qubits, num_classes)  # Map 16 quantum outputs to classes
         self.softmax = nn.Softmax(dim=1)
         
     def to(self, device):
         """Override to() to handle quantum circuit properly"""
         # Only move CNN and linear layer to device (QNN stays on CPU)
         self.cnn = self.cnn.to(device)
-        self.linear = self.linear.to(device)
+        self.fc_final = self.fc_final.to(device)
         return self
         
     def forward(self, x, apply_softmax=False):
@@ -223,11 +224,11 @@ class HybridCNNQNN(nn.Module):
         # Process with quantum circuit (requires CPU)
         # Move to CPU for quantum circuit, then back to original device
         x_cpu = x.cpu()
-        x_qnn = self.qnn(x_cpu)  # (batch, 1) - runs on CPU
+        x_qnn = self.qnn(x_cpu)  # (batch, 16) - SamplerQNN returns probability distribution
         x = x_qnn.to(cnn_device)  # Move back to GPU if needed
         
         # Projection to class logits (on GPU if available)
-        x = self.linear(x)  # (batch, num_classes)
+        x = self.fc_final(x)  # (batch, num_classes) - map 16 quantum probs to num_classes
 
         # Final probabilities
         # Apply softmax ONLY during inference if needed
@@ -370,10 +371,11 @@ def train_hybrid_model(
     train_loader,
     test_loader,
     validation_loader,
+    early_stop=2,
     epochs=20,
     learning_rate=0.001,
     device='cpu',
-    log_dir='logs'
+    log_dir='logs',
 ):
     """
     Train the hybrid CNN-QNN model with comprehensive logging.
@@ -387,7 +389,7 @@ def train_hybrid_model(
         learning_rate (float): Learning rate
         device (str): 'cpu' or 'cuda'
         log_dir (str): Directory to save logs
-    
+        early_stop (int): Early stopping patience
     Returns:
         dict: Training history (loss, accuracy) and best results
     """
@@ -409,7 +411,6 @@ def train_hybrid_model(
     
     # Track best model
     patient = 0
-    early_stop = 20  # Early stopping patience
     
     # Log training configuration
     config_log = {
@@ -753,13 +754,17 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Hybrid CNN-QNN Classifier for MNIST")
     parser.add_argument('--num_classes', type=int, default=4, help='Number of classes to classify (4, 6, or 8)')
-    parser.add_argument('--samples_per_class', type=int, default=400, help='Number of samples per class for training')
+    parser.add_argument('--samples_per_class', type=int, default=200, help='Number of samples per class for training')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.0005, help='Learning rate for optimizer')
     parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial'], help='Type of feature map for data re-uploading')
     parser.add_argument('--reps', type=int, default=2, help='Number of [feature_map → ansatz] repetitions')
+    parser.add_argument('--early_stop', type=int, default=2, help='Early stopping patience')
     args = parser.parse_args()
+
+    # Set mlflow experiment or create if it doesn't exist
+    mlflow.set_experiment("QuantumCNN_SamplerV2")
 
     with mlflow.start_run():
         # Configuration
@@ -770,6 +775,7 @@ def main():
         LEARNING_RATE = args.learning_rate
         FEATURE_MAP_TYPE = args.feature_map_type
         REPS = args.reps  # Number of [feature_map → ansatz] repetitions (standard=2, partial=3)
+        EARLY_STOP = args.early_stop
 
         # Log configuration to mlflow
         mlflow.log_params({
@@ -779,7 +785,8 @@ def main():
             'epochs': EPOCHS,
             'learning_rate': LEARNING_RATE,
             'feature_map_type': FEATURE_MAP_TYPE,
-            'reps': REPS
+            'reps': REPS,
+            'early_stop': EARLY_STOP
         })
 
         # Make result directory
@@ -825,7 +832,7 @@ def main():
 
         # Train the model    
         logger.info("Building hybrid CNN-QNN model...")
-        model = HybridCNNQNN(qnn, num_classes=NUM_CLASSES).to(device)
+        model = HybridCNNQNN(qnn, num_classes=NUM_CLASSES, num_qubits=4).to(device)
         logger.info(f"Model created successfully")
         logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
         logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -837,6 +844,7 @@ def main():
             test_loader,
             validation_loader,
             epochs=EPOCHS,
+            early_stop=EARLY_STOP,
             learning_rate=LEARNING_RATE,
             device=device,
             log_dir=os.path.join(results_dir)
@@ -879,6 +887,7 @@ def main():
             'best_val_f1': res['best_val']['f1'],
             'best_val_precision': res['best_val']['precision'],
             'best_val_recall': res['best_val']['recall'],
+            'best_epoch': res['best_epoch'],
             'total_training_time_sec': res['total_training_time']
         })
 

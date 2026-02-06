@@ -47,9 +47,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 from src.utils.feature_maps import (
     standard_reuploading_feature_map,
-    partial_reuploading_feature_map
+    partial_reuploading_feature_map,
+    partial_encoding_RA_feature_map
 )
-from src.utils.ansatz import tensor_ring
+from src.utils.ansatz import construct_tensor_ring_ansatz_circuit, tensor_ring
 
 logger = logging.getLogger(__name__)
 
@@ -100,25 +101,31 @@ class CNNFeatureExtractor(nn.Module):
         return x
 
 
-def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2):
+def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, ansatz_type='tensor_ring'):
     """
     Create the quantum neural network with data re-uploading and repetitions.
     
     Args:
-        feature_map_type (str): 'standard' or 'partial' re-uploading
+        feature_map_type (str): Type of feature map:
+            - 'standard': Standard re-uploading (Ry + Rx)
+            - 'partial': Partial re-uploading (sequential encoding)
+            - 'partial_RA': Partial encoding with only first 2 qubits (Rx + Rz per qubit)
         num_qubits (int): Number of qubits (must be 4)
         reps (int): Number of [feature_map → ansatz] repetitions
+        ansatz_type (str): Type of ansatz ('tensor_ring' or 'mps_ttn_combined')
     
     Returns:
-        TorchConnector wrapped quantum circuit
+        TorchConnector wrapped quantum circuit, circuit with measurements
     """
     logger.info(f"Creating {feature_map_type} re-uploading quantum circuit with {reps} repetitions")
     
     # Build complete circuit with repetitions
     full_circuit = QuantumCircuit(num_qubits)
-    
-    # Feature parameters (same features re-uploaded each time)
-    feature_params = ParameterVector('x', num_qubits)
+
+    if feature_map_type=='standard' or feature_map_type=='partial':
+        feature_params = ParameterVector('x', num_qubits)
+    elif feature_map_type=='partial_RA':
+        feature_params = ParameterVector('x', num_qubits*3)
     
     # Variational parameters (different for each repetition)
     all_var_params = []
@@ -129,11 +136,27 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2):
             fm = standard_reuploading_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
         elif feature_map_type == 'partial':
             fm = partial_reuploading_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
+        elif feature_map_type == 'partial_RA':
+            fm = partial_encoding_RA_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
         else:
             raise ValueError(f"Unknown feature map type: {feature_map_type}")
         
-        # Bind feature parameters (reuse same x₀, x₁, x₂, x₃)
-        param_dict = {fm.parameters[i]: feature_params[i] for i in range(len(fm.parameters))}
+        # Separate feature parameters (x) from variational parameters (w_L*) in feature map
+        fm_feature_params = [p for p in fm.parameters if p.name.startswith('x[')]
+        fm_var_params = [p for p in fm.parameters if not p.name.startswith('x[')]
+        
+        # Bind feature parameters (reuse same x₀, x₁, x₂, x₃ or x₀...x₁₁)
+        param_dict = {fm_feature_params[i]: feature_params[i] for i in range(len(fm_feature_params))}
+        
+        # If feature map has variational parameters (e.g., from RealAmplitudes), handle them
+        if fm_var_params:
+            # Create unique parameters for this repetition's feature map variational params
+            fm_var_params_vec = ParameterVector(f'θ_fm{rep}', len(fm_var_params))
+            all_var_params.extend(fm_var_params_vec)
+            # Add to param_dict
+            for i, p in enumerate(fm_var_params):
+                param_dict[p] = fm_var_params_vec[i]
+        
         fm_bound = fm.assign_parameters(param_dict)
         
         # Compose the feature map circuit directly (don't convert to gate)
@@ -143,7 +166,12 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2):
         full_circuit.barrier()
         
         # 2. Ansatz (variational circuit) - DIFFERENT parameters each time
-        ansatz = tensor_ring(num_qubits, reps=1).decompose()
+        if ansatz_type == 'tensor_ring':
+            ansatz = tensor_ring(num_qubits, reps=1).decompose()
+        elif ansatz_type == 'mps_ttn_combined':
+            ansatz = construct_tensor_ring_ansatz_circuit(num_qubits).decompose()
+        else:
+            raise ValueError(f"Unknown ansatz type: {ansatz_type}")
         
         # Create unique parameters for this repetition
         var_params = ParameterVector(f'θ_rep{rep}', ansatz.num_parameters)
@@ -758,7 +786,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.0005, help='Learning rate for optimizer')
-    parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial'], help='Type of feature map for data re-uploading')
+    parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial', 'partial_RA'], help='Type of feature map for data re-uploading')
+    parser.add_argument('--ansatz_type', type=str, default='tensor_ring', choices=['tensor_ring', 'mps_ttn_combined'], help='Type of ansatz for variational circuit')
     parser.add_argument('--reps', type=int, default=2, help='Number of [feature_map → ansatz] repetitions')
     parser.add_argument('--early_stop', type=int, default=2, help='Early stopping patience')
     args = parser.parse_args()
@@ -774,7 +803,8 @@ def main():
         EPOCHS = args.epochs
         LEARNING_RATE = args.learning_rate
         FEATURE_MAP_TYPE = args.feature_map_type
-        REPS = args.reps  # Number of [feature_map → ansatz] repetitions (standard=2, partial=3)
+        ANSZATZ_TYPE = args.ansatz_type
+        REPS = args.reps  # Number of [feature_map → ansatz] repetitions (standard=2, partial=3, partial_RA=3)
         EARLY_STOP = args.early_stop
 
         # Log configuration to mlflow
@@ -786,11 +816,12 @@ def main():
             'learning_rate': LEARNING_RATE,
             'feature_map_type': FEATURE_MAP_TYPE,
             'reps': REPS,
+            'ansatz_type': ANSZATZ_TYPE,
             'early_stop': EARLY_STOP
         })
 
         # Make result directory
-        results_dir = f'../results/{FEATURE_MAP_TYPE}_re-uploading_MNIST_{NUM_CLASSES}_classes_{SAMPLES_PER_CLASS}_samples_x_class'
+        results_dir = f'../results/{FEATURE_MAP_TYPE}_re-uploading_{ANSZATZ_TYPE}_MNIST_{NUM_CLASSES}_classes_{SAMPLES_PER_CLASS}_samples_x_class'
         os.makedirs(results_dir, exist_ok=True)
         
         # Configure logging to write to both file and console
@@ -821,15 +852,16 @@ def main():
         qnn, circuit = create_quantum_circuit(
             feature_map_type=FEATURE_MAP_TYPE, 
             num_qubits=4,
-            reps=REPS
+            reps=REPS,
+            ansatz_type=ANSZATZ_TYPE
         )
 
         # Plot and save quantum circuit diagram showing architecture
         # decompose_depth=0 shows high-level blocks (feature maps + ansatz)
         # decompose_depth=1+ shows individual gates (more detailed)
-        """circuit_plot_file = os.path.join(results_dir, f'quantum_circuit_{FEATURE_MAP_TYPE}_{NUM_CLASSES}classes_reps{REPS}.png')
+        """circuit_plot_file = os.path.join(results_dir, f'quantum_circuit_{FEATURE_MAP_TYPE}_{ANSZATZ_TYPE}_{NUM_CLASSES}classes_reps{REPS}.png')
         plot_circuit(circuit, filename=circuit_plot_file, decompose_depth=1)"""
-
+        
         # Train the model    
         logger.info("Building hybrid CNN-QNN model...")
         model = HybridCNNQNN(qnn, num_classes=NUM_CLASSES, num_qubits=4).to(device)

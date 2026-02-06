@@ -141,19 +141,15 @@ def TTN(num_qubits, **kwargs):
     return qc
 
 
-def construct_tensor_ring_ansatz_circuit(num_qubits, measured_qubits=0):
+def construct_tensor_ring_ansatz_circuit(num_qubits):
     # Function for the construction of the MPS+TTN ansatz
-    ansatz = QuantumCircuit(num_qubits, measured_qubits)
+    ansatz = QuantumCircuit(num_qubits)
 
     ttn = TTN(num_qubits, reps=1).decompose()
     tr = tensor_ring(num_qubits, reps=1).decompose()
 
     ansatz.compose(tr, range(num_qubits), inplace=True)
     ansatz.compose(ttn, range(num_qubits), inplace=True)
-
-    if measured_qubits > 0 and measured_qubits == 1:
-        # Modify this if needed another type of measurements
-        ansatz.measure(num_qubits-1, 0)
 
     return ansatz
 

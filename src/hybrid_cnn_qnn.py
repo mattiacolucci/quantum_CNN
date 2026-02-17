@@ -4,8 +4,8 @@ Project 10: Quantum Classifiers with Data Re-uploading on MNIST
 
 Architecture:
 1. Classical CNN extracts features from MNIST images
-2. CNN outputs 4 features
-3. VQC (Variational Quantum Circuit) with data re-uploading processes these 4 features
+2. CNN outputs features (dimension matches quantum circuit requirements)
+3. VQC (Variational Quantum Circuit) with data re-uploading processes these features
 4. Quantum circuit is measured for classification
 5. Final classification is done classically based on quantum measurements
 """
@@ -59,10 +59,10 @@ dagshub.init(repo_owner='mattiacolucci', repo_name='quantum_CNN', mlflow=True)
 
 class CNNFeatureExtractor(nn.Module):
     """
-    Classical CNN that extracts 4 features from MNIST images (28x28).
-    These 4 features will be fed to the quantum circuit.
+    Classical CNN that extracts features from MNIST images (28x28).
+    These features will be fed to the quantum circuit.
     """
-    def __init__(self):
+    def __init__(self, num_features=4):
         super().__init__()
         # Conv layers
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)  # 28x28 -> 28x28
@@ -75,7 +75,7 @@ class CNNFeatureExtractor(nn.Module):
         # Calculate size after convolutions: 28 -> 14 -> 7 -> 3 (after 3 pools)
         # But we'll do 2 pools: 28 -> 14 -> 7
         self.fc1 = nn.Linear(128 * 7 * 7, 128)
-        self.fc2 = nn.Linear(128, 4)  # Output 4 features for quantum circuit
+        self.fc2 = nn.Linear(128, num_features)  # Output features for quantum circuit
         
     def forward(self, x):
         # Conv blocks
@@ -93,7 +93,7 @@ class CNNFeatureExtractor(nn.Module):
         
         # FC layers
         x = F.relu(self.fc1(x))
-        x = self.fc2(x)  # Output 4 features
+        x = self.fc2(x)  # Output features
         
         # Normalize to [0, π] range for quantum encoding
         x = torch.sigmoid(x) * np.pi
@@ -123,9 +123,9 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
     full_circuit = QuantumCircuit(num_qubits)
 
     if feature_map_type=='standard' or feature_map_type=='partial':
-        feature_params = ParameterVector('x', num_qubits)
+        feature_params = ParameterVector('f', num_qubits)
     elif feature_map_type=='partial_RA':
-        feature_params = ParameterVector('x', num_qubits*3)
+        feature_params = ParameterVector('f', num_qubits*3)
     
     # Variational parameters (different for each repetition)
     all_var_params = []
@@ -141,9 +141,15 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
         else:
             raise ValueError(f"Unknown feature map type: {feature_map_type}")
         
+        # Decompose high-level library circuits (like RealAmplitudes)
+        fm = fm.decompose()
+        
         # Separate feature parameters (x) from variational parameters (w_L*) in feature map
-        fm_feature_params = [p for p in fm.parameters if p.name.startswith('x[')]
-        fm_var_params = [p for p in fm.parameters if not p.name.startswith('x[')]
+        # Sort to ensure matching by index
+        fm_feature_params = sorted([p for p in fm.parameters if p.name.startswith('x[')], 
+                                   key=lambda p: int(p.name.split('[')[1].split(']')[0]))
+        fm_var_params = sorted([p for p in fm.parameters if not p.name.startswith('x[')], 
+                               key=lambda p: p.name)
         
         # Bind feature parameters (reuse same x₀, x₁, x₂, x₃ or x₀...x₁₁)
         param_dict = {fm_feature_params[i]: feature_params[i] for i in range(len(fm_feature_params))}
@@ -225,13 +231,15 @@ class HybridCNNQNN(nn.Module):
     Hybrid CNN-Quantum Neural Network.
     
     Architecture:
-    1. CNN extracts 4 features from images
-    2. Quantum circuit processes these 4 features
+    1. CNN extracts features from images (dimension matches QNN input)
+    2. Quantum circuit processes these features
     3. Quantum output is used for classification
     """
     def __init__(self, qnn, num_classes=4, num_qubits=4):
         super().__init__()
-        self.cnn = CNNFeatureExtractor()
+        # Determine number of input features required by the QNN
+        num_inputs = qnn.neural_network.num_inputs
+        self.cnn = CNNFeatureExtractor(num_features=num_inputs)
         self.qnn = qnn  # TorchConnector wrapped quantum circuit
         # SamplerQNN returns 2^n probabilities (16 for 4 qubits)
         self.fc_final = nn.Linear(2**num_qubits, num_classes)  # Map 16 quantum outputs to classes
@@ -247,16 +255,16 @@ class HybridCNNQNN(nn.Module):
     def forward(self, x, apply_softmax=False):
         # Extract features with CNN (on GPU if available)
         cnn_device = next(self.cnn.parameters()).device
-        x = self.cnn(x)  # (batch, 4)
+        x = self.cnn(x)  # (batch, num_inputs)
         
         # Process with quantum circuit (requires CPU)
         # Move to CPU for quantum circuit, then back to original device
         x_cpu = x.cpu()
-        x_qnn = self.qnn(x_cpu)  # (batch, 16) - SamplerQNN returns probability distribution
+        x_qnn = self.qnn(x_cpu)  # (batch, 2^n) - SamplerQNN returns probability distribution
         x = x_qnn.to(cnn_device)  # Move back to GPU if needed
         
         # Projection to class logits (on GPU if available)
-        x = self.fc_final(x)  # (batch, num_classes) - map 16 quantum probs to num_classes
+        x = self.fc_final(x)  # (batch, num_classes) - map quantum probs to num_classes
 
         # Final probabilities
         # Apply softmax ONLY during inference if needed
@@ -629,10 +637,15 @@ def calculate_expressivity(circuit, num_qubits, trained_params, num_samples=1000
     logger.info(f"Circuit has {num_params} parameters")
     
     # Separate feature parameters and variational parameters
-    # Feature params: 'x[0]', 'x[1]', ... (first num_qubits params)
-    # Variational params: 'θ_rep0[0]', 'θ_rep0[1]', ... (remaining params)
-    num_feature_params = num_qubits
-    num_var_params = num_params - num_feature_params
+    # Feature params start with 'f'
+    # Variational params start with 'θ'
+    feature_params_list = sorted([p for p in params if p.name.startswith('f[')], 
+                                 key=lambda p: int(p.name.split('[')[1].split(']')[0]))
+    var_params_list = sorted([p for p in params if p.name.startswith('θ')],
+                              key=lambda p: p.name)
+    
+    num_feature_params = len(feature_params_list)
+    num_var_params = len(var_params_list)
     
     if len(trained_params) != num_var_params:
         logger.warning(f"Trained params length ({len(trained_params)}) doesn't match expected ({num_var_params})")
@@ -663,11 +676,9 @@ def calculate_expressivity(circuit, num_qubits, trained_params, num_samples=1000
         # Keep trained VARIATIONAL parameters fixed
         random_features = np.random.uniform(0, 2 * np.pi, num_feature_params)
         
-        # Combine: random features + trained variational parameters
-        all_params = np.concatenate([random_features, trained_params])
-        
-        # Bind parameters to circuit
-        param_dict = {params[i]: all_params[i] for i in range(num_params)}
+        # Bind parameters to circuit explicitly by parameter object
+        param_dict = {p: random_features[i] for i, p in enumerate(feature_params_list)}
+        param_dict.update({p: trained_params[i] for i, p in enumerate(var_params_list)})
         bound_circuit = circuit_with_meas.assign_parameters(param_dict)
         
         # Execute circuit

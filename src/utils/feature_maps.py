@@ -188,3 +188,57 @@ def simple_feature_map(num_qubits=4):
         qc.ry(features[i], i)
     
     return qc
+
+
+def standard_reuploading_2features_feature_map(num_qubits=4, hadamard_init=True, squared_transform=False):
+    """
+    Standard re-uploading with 2 features per qubit: RyRy + trainable block + RxRx + trainable block.
+    
+    Pattern:
+    1. (Optional) Hadamard initialization on all qubits
+    2. RyRy: Two Ry rotations per qubit with two different features (x[2i] and x[2i+1])
+    3. Trainable block (RealAmplitudes)
+    4. RxRx: Two Rx rotations per qubit with the same two features (x[2i] and x[2i+1])
+    5. Trainable block (RealAmplitudes)
+    
+    Total: 8 input features (2 per qubit) + RealAmplitudes variational parameters
+    
+    Args:
+        num_qubits (int): Number of qubits (should be 4)
+        hadamard_init (bool): Whether to apply Hadamard gates for initialization
+        squared_transform (bool): Whether to apply squared transformation to features
+    
+    Returns:
+        QuantumCircuit: Feature map circuit with embedded RealAmplitudes blocks
+    """
+    assert num_qubits == 4, "Standard re-uploading with 2 features per qubit uses 4 qubits"
+    
+    qc = QuantumCircuit(num_qubits)
+    features = ParameterVector('x', num_qubits * 2)  # 2 features per qubit = 8 features total
+    
+    if squared_transform:
+        features = [features[i]**2 / np.pi for i in range(num_qubits * 2)]
+    
+    # Block 1: RyRy - Two Ry rotations per qubit
+    for i in range(num_qubits):
+        qc.ry(features[2*i], i)      # First feature for qubit i
+        qc.ry(features[2*i + 1], i)  # Second feature for qubit i
+    qc.barrier()
+    
+    # Trainable block 1 (RealAmplitudes on all 4 qubits)
+    ra1 = RealAmplitudes(num_qubits=num_qubits, reps=1, parameter_prefix='w_L0', insert_barriers=False)
+    qc.compose(ra1, inplace=True)
+    qc.barrier()
+    
+    # Block 2: RxRx - Two Rx rotations per qubit with the same features
+    for i in range(num_qubits):
+        qc.rx(features[2*i], i)      # First feature for qubit i
+        qc.rx(features[2*i + 1], i)  # Second feature for qubit i
+    qc.barrier()
+    
+    # Trainable block 2 (RealAmplitudes on all 4 qubits)
+    ra2 = RealAmplitudes(num_qubits=num_qubits, reps=1, parameter_prefix='w_L1', insert_barriers=False)
+    qc.compose(ra2, inplace=True)
+    qc.barrier()
+    
+    return qc

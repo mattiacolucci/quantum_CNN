@@ -33,7 +33,7 @@ from sklearn.model_selection import KFold
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter, ParameterVector
 from qiskit.circuit.library import RealAmplitudes, ZZFeatureMap
-from qiskit_aer.primitives import EstimatorV2, SamplerV2
+from qiskit.primitives import StatevectorSampler  # Exact statevector simulation (no shots) — much faster than Aer SamplerV2
 from qiskit_machine_learning.neural_networks import SamplerQNN
 from qiskit_machine_learning.connectors import TorchConnector
 from qiskit.quantum_info import SparsePauliOp
@@ -48,9 +48,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from src.utils.feature_maps import (
     standard_reuploading_feature_map,
     partial_reuploading_feature_map,
-    partial_encoding_RA_feature_map
+    partial_encoding_RA_feature_map,
+    standard_reuploading_2features_feature_map
 )
-from src.utils.ansatz import construct_tensor_ring_ansatz_circuit, tensor_ring
+from src.utils.ansatz import construct_tensor_ring_ansatz_circuit, construct_mps_ttn_ansatz_circuit, tensor_ring
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +111,10 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
             - 'standard': Standard re-uploading (Ry + Rx)
             - 'partial': Partial re-uploading (sequential encoding)
             - 'partial_RA': Partial encoding with only first 2 qubits (Rx + Rz per qubit)
+            - 'standard_2features': Standard re-uploading with 2 features per qubit (RyRy + trainable + RxRx + trainable)
         num_qubits (int): Number of qubits (must be 4)
         reps (int): Number of [feature_map → ansatz] repetitions
-        ansatz_type (str): Type of ansatz ('tensor_ring' or 'mps_ttn_combined')
+        ansatz_type (str): Type of ansatz ('tensor_ring', 'mps_ttn_combined', or 'mps_ttn')
     
     Returns:
         TorchConnector wrapped quantum circuit, circuit with measurements
@@ -126,6 +128,8 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
         feature_params = ParameterVector('f', num_qubits)
     elif feature_map_type=='partial_RA':
         feature_params = ParameterVector('f', num_qubits*3)
+    elif feature_map_type=='standard_2features':
+        feature_params = ParameterVector('f', num_qubits*2)  # 2 features per qubit = 8 features
     
     # Variational parameters (different for each repetition)
     all_var_params = []
@@ -138,6 +142,8 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
             fm = partial_reuploading_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
         elif feature_map_type == 'partial_RA':
             fm = partial_encoding_RA_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
+        elif feature_map_type == 'standard_2features':
+            fm = standard_reuploading_2features_feature_map(num_qubits=num_qubits, hadamard_init=(True if rep == 0 else False), squared_transform=(True if rep > 0 else False))
         else:
             raise ValueError(f"Unknown feature map type: {feature_map_type}")
         
@@ -176,6 +182,8 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
             ansatz = tensor_ring(num_qubits, reps=1).decompose()
         elif ansatz_type == 'mps_ttn_combined':
             ansatz = construct_tensor_ring_ansatz_circuit(num_qubits).decompose()
+        elif ansatz_type == 'mps_ttn':
+            ansatz = construct_mps_ttn_ansatz_circuit(num_qubits).decompose()
         else:
             raise ValueError(f"Unknown ansatz type: {ansatz_type}")
         
@@ -200,10 +208,9 @@ def create_quantum_circuit(feature_map_type='standard', num_qubits=4, reps=2, an
     circuit_with_measurements = full_circuit.copy()
     circuit_with_measurements.measure_all()  # Add measurements to all qubits
     
-    # Create SamplerV2 primitive with options
-    sampler = SamplerV2()
-    sampler.options.default_shots = 4096
-    sampler.options.seed_simulator = 12345
+    # Use StatevectorSampler for exact statevector simulation (no shot noise, no sampling overhead)
+    # This is dramatically faster than Aer SamplerV2 for small circuits (4 qubits = 16-dim vector)
+    sampler = StatevectorSampler(seed=12345)
     
     # Create SamplerQNN with the complete circuit
     # SamplerQNN returns probability distribution over all 2^n computational basis states
@@ -663,41 +670,36 @@ def calculate_expressivity(circuit, num_qubits, trained_params, num_samples=1000
         circuit_with_meas.measure_all()
     
     # Step 2: Sample random parameter configurations and execute circuits
-    sampler = SamplerV2()
-    sampler.options.default_shots = shots
-    sampler.options.seed_simulator = 12345
+    # Use StatevectorSampler for exact probabilities (much faster than shot-based)
+    sampler = StatevectorSampler(seed=12345)
     
     # Collect all probability distributions from samples
     all_probs = []
+    num_states = 2 ** num_qubits
     
     logger.info("Sampling random input features with trained variational parameters...")
+    
+    # Batch all circuits for efficient execution
+    all_circuits = []
     for sample_idx in range(num_samples):
-        # Generate random INPUT features uniformly in [0, 2π]
-        # Keep trained VARIATIONAL parameters fixed
         random_features = np.random.uniform(0, 2 * np.pi, num_feature_params)
-        
-        # Bind parameters to circuit explicitly by parameter object
         param_dict = {p: random_features[i] for i, p in enumerate(feature_params_list)}
         param_dict.update({p: trained_params[i] for i, p in enumerate(var_params_list)})
         bound_circuit = circuit_with_meas.assign_parameters(param_dict)
-        
-        # Execute circuit
-        job = sampler.run([bound_circuit])
-        result = job.result()
-        
-        # Get measurement counts
-        counts = result[0].data.meas.get_counts()
-        
-        # Convert counts to probability distribution
-        # Build probability vector for all 2^n possible outcomes
-        num_states = 2 ** num_qubits
+        all_circuits.append(bound_circuit)
+    
+    # Execute all circuits in one batched call (much faster than one-by-one)
+    job = sampler.run(all_circuits)
+    results = job.result()
+    
+    for sample_idx in range(num_samples):
+        # StatevectorSampler returns exact probabilities via get_counts with infinite precision
+        counts = results[sample_idx].data.meas.get_counts()
+        total = sum(counts.values())
         prob_dist = np.zeros(num_states)
-        
         for bitstring, count in counts.items():
-            # Convert bitstring to integer index
             state_idx = int(bitstring, 2)
-            prob_dist[state_idx] = count / shots
-        
+            prob_dist[state_idx] = count / total
         all_probs.append(prob_dist)
     
     # Convert to array: shape (num_samples, 2^n)
@@ -797,8 +799,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.0005, help='Learning rate for optimizer')
-    parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial', 'partial_RA'], help='Type of feature map for data re-uploading')
-    parser.add_argument('--ansatz_type', type=str, default='tensor_ring', choices=['tensor_ring', 'mps_ttn_combined'], help='Type of ansatz for variational circuit')
+    parser.add_argument('--feature_map_type', type=str, default='standard', choices=['standard', 'partial', 'partial_RA', 'standard_2features'], help='Type of feature map for data re-uploading')
+    parser.add_argument('--ansatz_type', type=str, default='tensor_ring', choices=['tensor_ring', 'mps_ttn_combined', 'mps_ttn'], help='Type of ansatz for variational circuit')
     parser.add_argument('--reps', type=int, default=2, help='Number of [feature_map → ansatz] repetitions')
     parser.add_argument('--early_stop', type=int, default=2, help='Early stopping patience')
     args = parser.parse_args()
@@ -846,7 +848,7 @@ def main():
         logger.setLevel(logging.INFO)
         
         # Device
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = 'cpu'
         logger.info(f"Using device: {device}")
         
         # Load data
@@ -910,7 +912,7 @@ def main():
             trained_params=trained_weights,
             num_samples=1000,  # Number of random input feature samples
             num_bins=75,       # Number of bins for distribution
-            shots=4096         # Shots per circuit execution
+            shots=256         # Shots per circuit execution
         )
         logger.info(f"Circuit Expressivity (KL-divergence): {expressivity:.6f}")
         logger.info("=" * 60)
